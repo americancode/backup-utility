@@ -1,0 +1,293 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-postgres-azure-backup
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minio-postgres-azure-backup
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backup
+          image: registry.example.com/backup-tools:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: backup-config
+            - secretRef:
+                name: backup-credentials
+          volumeMounts:
+            - name: backup-work
+              mountPath: /backup
+          command:
+            - /bin/bash
+            - -lc
+          args:
+            - |
+              set -Eeuo pipefail
+
+              log() {
+                printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
+              }
+
+              die() {
+                log "ERROR: $*"
+                exit 1
+              }
+
+              require_env() {
+                local name="$1"
+                if [ -z "${!name:-}" ]; then
+                  die "Missing required environment variable: ${name}"
+                fi
+              }
+
+              azure_args=()
+              AZURE_TARGET_TYPE="${AZURE_TARGET_TYPE:-blob}"
+
+              configure_azure_args() {
+                case "$AZURE_TARGET_TYPE" in
+                  blob)
+                    AZURE_BLOB_CONTAINER="${AZURE_BLOB_CONTAINER:-${AZURE_CONTAINER:-}}"
+                    require_env AZURE_BLOB_CONTAINER
+                    ;;
+                  file)
+                    AZURE_FILE_SHARE="${AZURE_FILE_SHARE:-${AZURE_SHARE:-}}"
+                    require_env AZURE_FILE_SHARE
+                    ;;
+                  *)
+                    die "AZURE_TARGET_TYPE must be 'blob' or 'file'"
+                    ;;
+                esac
+
+                if [ -n "${AZURE_STORAGE_CONNECTION_STRING:-}" ]; then
+                  azure_args=(--connection-string "$AZURE_STORAGE_CONNECTION_STRING")
+                  return
+                fi
+
+                require_env AZURE_STORAGE_ACCOUNT
+
+                if [ -n "${AZURE_STORAGE_KEY:-}" ]; then
+                  azure_args=(--account-name "$AZURE_STORAGE_ACCOUNT" --account-key "$AZURE_STORAGE_KEY")
+                  return
+                fi
+
+                if [ -n "${AZURE_STORAGE_SAS_TOKEN:-}" ]; then
+                  azure_args=(--account-name "$AZURE_STORAGE_ACCOUNT" --sas-token "$AZURE_STORAGE_SAS_TOKEN")
+                  return
+                fi
+
+                die "Provide AZURE_STORAGE_CONNECTION_STRING, or AZURE_STORAGE_ACCOUNT with AZURE_STORAGE_KEY or AZURE_STORAGE_SAS_TOKEN"
+              }
+
+              ensure_azure_destination() {
+                if [ "${AZURE_CREATE_DESTINATION:-true}" != "true" ]; then
+                  log "Skipping Azure destination creation because AZURE_CREATE_DESTINATION is not true"
+                  return 0
+                fi
+
+                case "$AZURE_TARGET_TYPE" in
+                  blob)
+                    log "Ensuring Azure Blob container ${AZURE_BLOB_CONTAINER} exists"
+                    az storage container create \
+                      "${azure_args[@]}" \
+                      --name "$AZURE_BLOB_CONTAINER" \
+                      --only-show-errors >/dev/null
+                    ;;
+                  file)
+                    log "Ensuring Azure Files share ${AZURE_FILE_SHARE} exists"
+                    az storage share create \
+                      "${azure_args[@]}" \
+                      --name "$AZURE_FILE_SHARE" \
+                      --only-show-errors >/dev/null
+                    ;;
+                esac
+              }
+
+              ensure_file_share_dirs() {
+                local file_path="$1"
+                local dir_path="${file_path%/*}"
+                local current=""
+                local part exists
+
+                [ "$dir_path" != "$file_path" ] || return 0
+
+                IFS='/' read -r -a parts <<<"$dir_path"
+                for part in "${parts[@]}"; do
+                  [ -n "$part" ] || continue
+
+                  if [ -z "$current" ]; then
+                    current="$part"
+                  else
+                    current="${current}/${part}"
+                  fi
+
+                  exists="$(az storage directory exists \
+                    "${azure_args[@]}" \
+                    --share-name "$AZURE_FILE_SHARE" \
+                    --name "$current" \
+                    --query exists \
+                    -o tsv \
+                    --only-show-errors)"
+
+                  if [ "$exists" != "True" ] && [ "$exists" != "true" ]; then
+                    az storage directory create \
+                      "${azure_args[@]}" \
+                      --share-name "$AZURE_FILE_SHARE" \
+                      --name "$current" \
+                      --only-show-errors >/dev/null
+                  fi
+                done
+              }
+
+              upload_artifact() {
+                local file="$1"
+                local artifact_path="$2"
+
+                case "$AZURE_TARGET_TYPE" in
+                  blob)
+                    log "Uploading ${file} to azure-blob://${AZURE_BLOB_CONTAINER}/${artifact_path}"
+                    az storage blob upload \
+                      "${azure_args[@]}" \
+                      --container-name "$AZURE_BLOB_CONTAINER" \
+                      --name "$artifact_path" \
+                      --file "$file" \
+                      --overwrite true \
+                      --only-show-errors >/dev/null
+                    ;;
+                  file)
+                    log "Uploading ${file} to azure-file://${AZURE_FILE_SHARE}/${artifact_path}"
+                    ensure_file_share_dirs "$artifact_path"
+                    az storage file upload \
+                      "${azure_args[@]}" \
+                      --share-name "$AZURE_FILE_SHARE" \
+                      --source "$file" \
+                      --path "$artifact_path" \
+                      --only-show-errors >/dev/null
+                    ;;
+                esac
+              }
+
+              slugify() {
+                printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-'
+              }
+
+              backup_minio() {
+                [ -n "${MINIO_ENDPOINT:-}" ] || return 0
+
+                require_env MINIO_ACCESS_KEY
+                require_env MINIO_SECRET_KEY
+
+                local alias_name="${MINIO_ALIAS:-source}"
+                local api="${MINIO_API:-S3v4}"
+                local path_mode="${MINIO_PATH:-auto}"
+
+                log "Configuring MinIO alias ${alias_name} for ${MINIO_ENDPOINT}"
+                mc alias set "$alias_name" "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY" \
+                  --api "$api" \
+                  --path "$path_mode" >/dev/null
+
+                local buckets=()
+                if [ -n "${MINIO_BUCKETS:-}" ]; then
+                  read -r -a buckets <<<"$MINIO_BUCKETS"
+                else
+                  log "MINIO_BUCKETS is not set; discovering buckets from ${alias_name}"
+                  mapfile -t buckets < <(mc ls "$alias_name" | awk '{print $NF}' | sed 's#/$##')
+                fi
+
+                if [ "${#buckets[@]}" -eq 0 ]; then
+                  log "No MinIO buckets selected"
+                  return 0
+                fi
+
+                local bucket bucket_slug bucket_dir archive blob_name
+                for bucket in "${buckets[@]}"; do
+                  [ -n "$bucket" ] || continue
+                  bucket_slug="$(slugify "$bucket")"
+                  bucket_dir="${WORKDIR}/minio/${bucket_slug}"
+                  archive="${WORKDIR}/minio-${bucket_slug}-${BACKUP_TIMESTAMP}.tar.gz"
+                  blob_name="${BACKUP_PREFIX}/minio/${bucket_slug}/${BACKUP_TIMESTAMP}.tar.gz"
+
+                  mkdir -p "$bucket_dir"
+                  log "Mirroring MinIO bucket ${bucket}"
+                  mc mirror --overwrite "${alias_name}/${bucket}" "$bucket_dir"
+
+                  log "Creating archive ${archive}"
+                  tar -C "$bucket_dir" -czf "$archive" .
+                  upload_artifact "$archive" "$blob_name"
+                done
+              }
+
+              backup_postgres() {
+                if [ -z "${DATABASE_URL:-}" ] && [ -z "${PGDATABASE:-}" ] && [ -z "${PGDATABASES:-}" ]; then
+                  log "No PostgreSQL database configured; skipping pg_dump"
+                  return 0
+                fi
+
+                mkdir -p "${WORKDIR}/postgres"
+
+                if [ -n "${DATABASE_URL:-}" ]; then
+                  local archive="${WORKDIR}/postgres/database-url-${BACKUP_TIMESTAMP}.dump"
+                  local blob_name="${BACKUP_PREFIX}/postgres/database-url/${BACKUP_TIMESTAMP}.dump"
+
+                  log "Dumping PostgreSQL database from DATABASE_URL"
+                  pg_dump \
+                    --format=custom \
+                    --no-owner \
+                    --no-acl \
+                    --file "$archive" \
+                    "$DATABASE_URL"
+
+                  upload_artifact "$archive" "$blob_name"
+                  return 0
+                fi
+
+                local databases=()
+                if [ -n "${PGDATABASES:-}" ]; then
+                  read -r -a databases <<<"$PGDATABASES"
+                else
+                  databases=("$PGDATABASE")
+                fi
+
+                local database database_slug archive blob_name
+                for database in "${databases[@]}"; do
+                  [ -n "$database" ] || continue
+                  database_slug="$(slugify "$database")"
+                  archive="${WORKDIR}/postgres/${database_slug}-${BACKUP_TIMESTAMP}.dump"
+                  blob_name="${BACKUP_PREFIX}/postgres/${database_slug}/${BACKUP_TIMESTAMP}.dump"
+
+                  log "Dumping PostgreSQL database ${database}"
+                  PGDATABASE="$database" pg_dump \
+                    --format=custom \
+                    --no-owner \
+                    --no-acl \
+                    --file "$archive"
+
+                  upload_artifact "$archive" "$blob_name"
+                done
+              }
+
+              configure_azure_args
+
+              BACKUP_TIMESTAMP="${BACKUP_TIMESTAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
+              BACKUP_PREFIX="${BACKUP_PREFIX:-backups}"
+              WORKDIR="${WORKDIR:-/backup/work}"
+              WORKDIR="${WORKDIR%/}/${BACKUP_TIMESTAMP}"
+              export BACKUP_TIMESTAMP BACKUP_PREFIX WORKDIR
+
+              mkdir -p "$WORKDIR"
+
+              ensure_azure_destination
+
+              backup_minio
+              backup_postgres
+
+              log "Backup complete"
+      volumes:
+        - name: backup-work
+          emptyDir:
+            sizeLimit: 100Gi

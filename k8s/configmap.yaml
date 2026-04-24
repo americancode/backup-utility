@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-config
+data:
+  # Set AZURE_TARGET_TYPE to "blob" or "file".
+  AZURE_TARGET_TYPE: blob
+  AZURE_BLOB_CONTAINER: database-and-minio-backups
+  AZURE_FILE_SHARE: database-and-minio-backups
+  AZURE_CREATE_DESTINATION: "true"
+  BACKUP_PREFIX: k8s
+  WORKDIR: /backup/work
+
+  # Set MINIO_ENDPOINT to enable MinIO bucket backups.
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_BUCKETS: bucket-a bucket-b
+  MINIO_ALIAS: source
+  MINIO_API: S3v4
+  MINIO_PATH: auto
+
+  # PostgreSQL libpq variables. Use PGDATABASES for multiple DBs on one server.
+  PGHOST: postgres
+  PGPORT: "5432"
+  PGUSER: postgres
+  PGDATABASE: app
+  # PGDATABASES: app analytics
+  # DATABASE_URL: postgresql://postgres:postgres@postgres:5432/app
