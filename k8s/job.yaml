@@ -11,10 +11,22 @@ spec:
         app.kubernetes.io/name: minio-postgres-azure-backup
     spec:
       restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: backup
           image: registry.example.com/backup-tools:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           envFrom:
             - configMapRef:
                 name: backup-config
@@ -156,7 +168,6 @@ spec:
                       --container-name "$AZURE_BLOB_CONTAINER" \
                       --name "$artifact_path" \
                       --file "$file" \
-                      --overwrite true \
                       --only-show-errors >/dev/null
                     ;;
                   file)
