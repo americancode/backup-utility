@@ -1,5 +1,5 @@
 ARG ALPINE_VERSION=3.23
-ARG AZCOPY_VERSION=10.31.1
+ARG AZCOPY_VERSION=10.32.3
 
 FROM alpine:${ALPINE_VERSION} AS azure-cli
 
@@ -36,6 +36,7 @@ RUN apk upgrade --no-cache \
     && apk add --no-cache \
       ca-certificates \
       curl \
+      gcompat \
       tar \
     && case "${TARGETARCH}" in \
       amd64) azcopy_arch='amd64' ;; \
@@ -61,6 +62,7 @@ RUN apk upgrade --no-cache \
       ca-certificates \
       coreutils \
       curl \
+      gcompat \
       gzip \
       libffi \
       minio-client \
