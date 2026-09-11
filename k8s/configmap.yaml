@@ -8,6 +8,18 @@ data:
   AZURE_BLOB_CONTAINER: database-and-minio-backups
   AZURE_FILE_SHARE: database-and-minio-backups
   AZURE_CREATE_DESTINATION: "true"
+
+  # Optional S3-compatible destination. Set S3_TARGET_BUCKET to enable it.
+  S3_TARGET_ENDPOINT: https://s3.example.com
+  S3_TARGET_BUCKET: database-and-minio-backups
+  S3_TARGET_ALIAS: backup-s3
+  S3_TARGET_API: S3v4
+  S3_TARGET_PATH: auto
+
+  # Optional PVC destination. Artifacts are stored below this directory using
+  # the same BACKUP_PREFIX/timestamp path as the remote destinations.
+  PVC_BACKUP_DIR: /backup/pvc
+
   BACKUP_PREFIX: k8s
   WORKDIR: /backup/work
 

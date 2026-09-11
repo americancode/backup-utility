@@ -61,42 +61,8 @@ spec:
               azure_args=()
               AZURE_TARGET_TYPE="${AZURE_TARGET_TYPE:-blob}"
 
-              configure_azure_args() {
-                case "$AZURE_TARGET_TYPE" in
-                  blob)
-                    AZURE_BLOB_CONTAINER="${AZURE_BLOB_CONTAINER:-${AZURE_CONTAINER:-}}"
-                    require_env AZURE_BLOB_CONTAINER
-                    ;;
-                  file)
-                    AZURE_FILE_SHARE="${AZURE_FILE_SHARE:-${AZURE_SHARE:-}}"
-                    require_env AZURE_FILE_SHARE
-                    ;;
-                  *)
-                    die "AZURE_TARGET_TYPE must be 'blob' or 'file'"
-                    ;;
-                esac
-
-                if [ -n "${AZURE_STORAGE_CONNECTION_STRING:-}" ]; then
-                  azure_args=(--connection-string "$AZURE_STORAGE_CONNECTION_STRING")
-                  return
-                fi
-
-                require_env AZURE_STORAGE_ACCOUNT
-
-                if [ -n "${AZURE_STORAGE_KEY:-}" ]; then
-                  azure_args=(--account-name "$AZURE_STORAGE_ACCOUNT" --account-key "$AZURE_STORAGE_KEY")
-                  return
-                fi
-
-                if [ -n "${AZURE_STORAGE_SAS_TOKEN:-}" ]; then
-                  azure_args=(--account-name "$AZURE_STORAGE_ACCOUNT" --sas-token "$AZURE_STORAGE_SAS_TOKEN")
-                  return
-                fi
-
-                die "Provide AZURE_STORAGE_CONNECTION_STRING, or AZURE_STORAGE_ACCOUNT with AZURE_STORAGE_KEY or AZURE_STORAGE_SAS_TOKEN"
-              }
-
               ensure_azure_destination() {
+                [ "${AZURE_ENABLED:-false}" = "true" ] || return 0
                 if [ "${AZURE_CREATE_DESTINATION:-true}" != "true" ]; then
                   log "Skipping Azure destination creation because AZURE_CREATE_DESTINATION is not true"
                   return 0
@@ -160,27 +126,41 @@ spec:
                 local file="$1"
                 local artifact_path="$2"
 
-                case "$AZURE_TARGET_TYPE" in
-                  blob)
-                    log "Uploading ${file} to azure-blob://${AZURE_BLOB_CONTAINER}/${artifact_path}"
-                    az storage blob upload \
-                      "${azure_args[@]}" \
-                      --container-name "$AZURE_BLOB_CONTAINER" \
-                      --name "$artifact_path" \
-                      --file "$file" \
-                      --only-show-errors >/dev/null
-                    ;;
-                  file)
-                    log "Uploading ${file} to azure-file://${AZURE_FILE_SHARE}/${artifact_path}"
-                    ensure_file_share_dirs "$artifact_path"
-                    az storage file upload \
-                      "${azure_args[@]}" \
-                      --share-name "$AZURE_FILE_SHARE" \
-                      --source "$file" \
-                      --path "$artifact_path" \
-                      --only-show-errors >/dev/null
-                    ;;
-                esac
+                if [ "${AZURE_ENABLED:-false}" = "true" ]; then
+                  case "$AZURE_TARGET_TYPE" in
+                    blob)
+                      log "Uploading ${file} to azure-blob://${AZURE_BLOB_CONTAINER}/${artifact_path}"
+                      az storage blob upload \
+                        "${azure_args[@]}" \
+                        --container-name "$AZURE_BLOB_CONTAINER" \
+                        --name "$artifact_path" \
+                        --file "$file" \
+                        --only-show-errors >/dev/null
+                      ;;
+                    file)
+                      log "Uploading ${file} to azure-file://${AZURE_FILE_SHARE}/${artifact_path}"
+                      ensure_file_share_dirs "$artifact_path"
+                      az storage file upload \
+                        "${azure_args[@]}" \
+                        --share-name "$AZURE_FILE_SHARE" \
+                        --source "$file" \
+                        --path "$artifact_path" \
+                        --only-show-errors >/dev/null
+                      ;;
+                  esac
+                fi
+
+                if [ "${S3_ENABLED:-false}" = "true" ]; then
+                  log "Uploading ${file} to s3://${S3_TARGET_BUCKET}/${artifact_path}"
+                  mc cp "$file" "${S3_TARGET_ALIAS}/${S3_TARGET_BUCKET}/${artifact_path}"
+                fi
+
+                if [ -n "${PVC_BACKUP_DIR:-}" ]; then
+                  local pvc_file="${PVC_BACKUP_DIR%/}/${artifact_path}"
+                  log "Copying ${file} to ${pvc_file}"
+                  mkdir -p "$(dirname "$pvc_file")"
+                  cp "$file" "$pvc_file"
+                fi
               }
 
               slugify() {
@@ -282,7 +262,62 @@ spec:
                 done
               }
 
-              configure_azure_args
+              configure_azure_args() {
+                AZURE_ENABLED=false
+                if [ -z "${AZURE_STORAGE_CONNECTION_STRING:-}" ] && [ -z "${AZURE_STORAGE_ACCOUNT:-}" ]; then
+                  log "Azure destination is not configured"
+                  return 0
+                fi
+
+                AZURE_ENABLED=true
+                case "$AZURE_TARGET_TYPE" in
+                  blob)
+                    AZURE_BLOB_CONTAINER="${AZURE_BLOB_CONTAINER:-${AZURE_CONTAINER:-}}"
+                    require_env AZURE_BLOB_CONTAINER
+                    ;;
+                  file)
+                    AZURE_FILE_SHARE="${AZURE_FILE_SHARE:-${AZURE_SHARE:-}}"
+                    require_env AZURE_FILE_SHARE
+                    ;;
+                  *)
+                    die "AZURE_TARGET_TYPE must be 'blob' or 'file'"
+                    ;;
+                esac
+
+                if [ -n "${AZURE_STORAGE_CONNECTION_STRING:-}" ]; then
+                  azure_args=(--connection-string "$AZURE_STORAGE_CONNECTION_STRING")
+                  return
+                fi
+
+                require_env AZURE_STORAGE_ACCOUNT
+                if [ -n "${AZURE_STORAGE_KEY:-}" ]; then
+                  azure_args=(--account-name "$AZURE_STORAGE_ACCOUNT" --account-key "$AZURE_STORAGE_KEY")
+                elif [ -n "${AZURE_STORAGE_SAS_TOKEN:-}" ]; then
+                  azure_args=(--account-name "$AZURE_STORAGE_ACCOUNT" --sas-token "$AZURE_STORAGE_SAS_TOKEN")
+                else
+                  die "Provide AZURE_STORAGE_CONNECTION_STRING, or AZURE_STORAGE_ACCOUNT with AZURE_STORAGE_KEY or AZURE_STORAGE_SAS_TOKEN"
+                fi
+              }
+
+              configure_s3_destination() {
+                S3_ENABLED=false
+                if [ -z "${S3_TARGET_BUCKET:-}" ]; then
+                  log "S3 destination is not configured"
+                  return 0
+                fi
+
+                require_env S3_TARGET_ENDPOINT
+                require_env S3_TARGET_ACCESS_KEY
+                require_env S3_TARGET_SECRET_KEY
+                S3_TARGET_ALIAS="${S3_TARGET_ALIAS:-backup-s3}"
+                S3_TARGET_API="${S3_TARGET_API:-S3v4}"
+                S3_TARGET_PATH="${S3_TARGET_PATH:-auto}"
+                log "Configuring S3 destination ${S3_TARGET_ALIAS} for ${S3_TARGET_ENDPOINT}"
+                mc alias set "$S3_TARGET_ALIAS" "$S3_TARGET_ENDPOINT" "$S3_TARGET_ACCESS_KEY" "$S3_TARGET_SECRET_KEY" \
+                  --api "$S3_TARGET_API" \
+                  --path "$S3_TARGET_PATH" >/dev/null
+                S3_ENABLED=true
+              }
 
               BACKUP_TIMESTAMP="${BACKUP_TIMESTAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
               BACKUP_PREFIX="${BACKUP_PREFIX:-backups}"
@@ -292,6 +327,14 @@ spec:
 
               mkdir -p "$WORKDIR"
 
+              configure_azure_args
+              configure_s3_destination
+              if [ -n "${PVC_BACKUP_DIR:-}" ]; then
+                mkdir -p "$PVC_BACKUP_DIR"
+              fi
+              if [ "${AZURE_ENABLED:-false}" != "true" ] && [ "${S3_ENABLED:-false}" != "true" ] && [ -z "${PVC_BACKUP_DIR:-}" ]; then
+                die "Configure at least one destination: Azure, S3_TARGET_BUCKET, or PVC_BACKUP_DIR"
+              fi
               ensure_azure_destination
 
               backup_minio
@@ -302,3 +345,6 @@ spec:
         - name: backup-work
           emptyDir:
             sizeLimit: 100Gi
+        - name: backup-pvc
+          persistentVolumeClaim:
+            claimName: backup-pvc
