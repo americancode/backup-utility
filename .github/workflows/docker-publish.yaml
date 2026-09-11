@@ -183,12 +183,11 @@ jobs:
         if: github.event_name != 'pull_request'
         env:
           IMAGE: ${{ steps.names.outputs.image }}
-          TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.publish-image.outputs.digest }}
           WORKFLOW_IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
         run: |
           set -euo pipefail
-          cosign sign --yes "${IMAGE}@${DIGEST}"
+          cosign sign --yes --recursive "${IMAGE}@${DIGEST}"
           cosign verify "${IMAGE}@${DIGEST}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "${WORKFLOW_IDENTITY}"
